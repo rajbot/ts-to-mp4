@@ -1,12 +1,13 @@
 # ts-to-mp4
 
-A pure Rust library for remuxing MPEG-TS to MP4 without transcoding, similar to `ffmpeg -c copy`.
+A pure Rust library and CLI tool for remuxing MPEG-TS to MP4 without transcoding, similar to `ffmpeg -c copy`.
 
 ## Features
 
 - **No transcoding** - Copies H.264 video and AAC audio streams directly
 - **Pure Rust** - No external dependencies like ffmpeg
 - **Simple API** - Just `remux(input, output)`
+- **CLI included** - Convert files from the command line
 
 ## What it does
 
@@ -15,7 +16,28 @@ A pure Rust library for remuxing MPEG-TS to MP4 without transcoding, similar to 
 3. **Processes AAC** - Strips ADTS headers from audio frames
 4. **Muxes to MP4** - Writes a valid MP4 container with proper metadata
 
-## Usage
+## Command Line Usage
+
+### Install
+
+```bash
+cargo install --git https://github.com/rajbot/ts-to-mp4 --features cli
+```
+
+### Run
+
+```bash
+# Convert input.ts to input.mp4
+ts-to-mp4 input.ts
+
+# Specify output filename
+ts-to-mp4 input.ts -o output.mp4
+
+# Show help
+ts-to-mp4 --help
+```
+
+## Library Usage
 
 Add to your `Cargo.toml`:
 
