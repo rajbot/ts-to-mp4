@@ -497,7 +497,6 @@ struct AacConfig {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 struct AacSample {
     pts: Option<u64>,
     data: Vec<u8>,
@@ -681,6 +680,7 @@ fn write_mp4<W: Write + Seek>(
         audio_config,
         &audio_offsets,
         &audio_sizes,
+        audio_samples,
         audio_timescale,
         audio_duration,
     )?;
@@ -716,6 +716,7 @@ fn write_moov<W: Write>(
     audio_config: Option<&AacConfig>,
     audio_offsets: &[u32],
     audio_sizes: &[u32],
+    audio_samples: &[AacSample],
     audio_timescale: u32,
     audio_duration: u64,
 ) -> Result<()> {
@@ -742,6 +743,7 @@ fn write_moov<W: Write>(
             audio_cfg,
             audio_offsets,
             audio_sizes,
+            audio_samples,
             audio_timescale,
             audio_duration,
         )?;
@@ -1300,6 +1302,7 @@ fn write_audio_trak<W: Write>(
     config: &AacConfig,
     offsets: &[u32],
     sizes: &[u32],
+    samples: &[AacSample],
     timescale: u32,
     duration: u64,
 ) -> Result<()> {
@@ -1309,7 +1312,7 @@ fn write_audio_trak<W: Write>(
     write_audio_tkhd(&mut trak_data, 2, duration)?;
 
     // mdia
-    write_audio_mdia(&mut trak_data, config, offsets, sizes, timescale, duration)?;
+    write_audio_mdia(&mut trak_data, config, offsets, sizes, samples, timescale, duration)?;
 
     let size = (8 + trak_data.len()) as u32;
     writer.write_all(&size.to_be_bytes())?;
@@ -1360,6 +1363,7 @@ fn write_audio_mdia<W: Write>(
     config: &AacConfig,
     offsets: &[u32],
     sizes: &[u32],
+    samples: &[AacSample],
     timescale: u32,
     duration: u64,
 ) -> Result<()> {
@@ -1372,7 +1376,7 @@ fn write_audio_mdia<W: Write>(
     write_hdlr(&mut mdia_data, b"soun", b"SoundHandler")?;
 
     // minf
-    write_audio_minf(&mut mdia_data, config, offsets, sizes)?;
+    write_audio_minf(&mut mdia_data, config, offsets, sizes, samples)?;
 
     let size = (8 + mdia_data.len()) as u32;
     writer.write_all(&size.to_be_bytes())?;
@@ -1386,6 +1390,7 @@ fn write_audio_minf<W: Write>(
     config: &AacConfig,
     offsets: &[u32],
     sizes: &[u32],
+    samples: &[AacSample],
 ) -> Result<()> {
     let mut minf_data = Vec::new();
 
@@ -1396,7 +1401,7 @@ fn write_audio_minf<W: Write>(
     write_dinf(&mut minf_data)?;
 
     // stbl
-    write_audio_stbl(&mut minf_data, config, offsets, sizes)?;
+    write_audio_stbl(&mut minf_data, config, offsets, sizes, samples)?;
 
     let size = (8 + minf_data.len()) as u32;
     writer.write_all(&size.to_be_bytes())?;
@@ -1425,14 +1430,15 @@ fn write_audio_stbl<W: Write>(
     config: &AacConfig,
     offsets: &[u32],
     sizes: &[u32],
+    samples: &[AacSample],
 ) -> Result<()> {
     let mut stbl_data = Vec::new();
 
     // stsd
     write_audio_stsd(&mut stbl_data, config)?;
 
-    // stts
-    write_stts(&mut stbl_data, sizes.len(), 1024)?; // AAC frame = 1024 samples
+    // stts - use actual PTS values if available
+    write_audio_stts(&mut stbl_data, samples, config.sample_rate)?;
 
     // stsc
     write_stsc(&mut stbl_data)?;
@@ -1447,6 +1453,79 @@ fn write_audio_stbl<W: Write>(
     writer.write_all(&size.to_be_bytes())?;
     writer.write_all(b"stbl")?;
     writer.write_all(&stbl_data)?;
+    Ok(())
+}
+
+/// Write audio stts box using actual PTS values from samples
+fn write_audio_stts<W: Write>(writer: &mut W, samples: &[AacSample], sample_rate: u32) -> Result<()> {
+    if samples.is_empty() {
+        return write_stts(writer, 0, 1024);
+    }
+
+    // Collect PTS values (in 90kHz timescale from MPEG-TS)
+    let pts_values: Vec<u64> = samples.iter().map(|s| s.pts.unwrap_or(0)).collect();
+
+    // Check if we have valid timestamps
+    let has_valid_timestamps = pts_values.iter().any(|&pts| pts > 0);
+
+    if !has_valid_timestamps {
+        // Fall back to constant 1024 samples per frame
+        return write_stts(writer, samples.len(), 1024);
+    }
+
+    // Convert PTS (90kHz) to audio sample counts and calculate deltas
+    // Audio timescale is sample_rate (e.g., 44100 Hz)
+    // PTS is in 90000 Hz
+    let mut deltas: Vec<u32> = Vec::new();
+
+    for i in 0..samples.len() {
+        let delta = if i + 1 < samples.len() {
+            let current_pts = pts_values[i];
+            let next_pts = pts_values[i + 1];
+            if next_pts > current_pts {
+                // Convert from 90kHz to audio sample rate
+                // delta_samples = (delta_pts / 90000) * sample_rate
+                let delta_pts = next_pts - current_pts;
+                ((delta_pts as u64 * sample_rate as u64) / 90000) as u32
+            } else {
+                1024 // Default AAC frame size
+            }
+        } else {
+            // Last sample - use 1024 or previous delta
+            if !deltas.is_empty() {
+                deltas[deltas.len() - 1]
+            } else {
+                1024
+            }
+        };
+        deltas.push(delta);
+    }
+
+    // Run-length encode the deltas
+    let mut entries: Vec<(u32, u32)> = Vec::new();
+    for delta in deltas {
+        if let Some(last) = entries.last_mut() {
+            if last.1 == delta {
+                last.0 += 1;
+                continue;
+            }
+        }
+        entries.push((1, delta));
+    }
+
+    let mut data = Vec::new();
+    data.push(0); // version
+    data.extend_from_slice(&[0, 0, 0]); // flags
+    data.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (count, delta) in entries {
+        data.extend_from_slice(&count.to_be_bytes());
+        data.extend_from_slice(&delta.to_be_bytes());
+    }
+
+    let size = (8 + data.len()) as u32;
+    writer.write_all(&size.to_be_bytes())?;
+    writer.write_all(b"stts")?;
+    writer.write_all(&data)?;
     Ok(())
 }
 
