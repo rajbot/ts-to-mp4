@@ -424,6 +424,10 @@ fn process_h264_samples(samples: &[Sample]) -> Result<(Option<H264Config>, Vec<H
                             level,
                         });
                     }
+                    // Also include SPS in stream for decoder compatibility
+                    let len = nal_data.len() as u32;
+                    avcc_data.extend_from_slice(&len.to_be_bytes());
+                    avcc_data.extend_from_slice(nal_data);
                 }
                 NAL_TYPE_PPS => {
                     if let Some(ref mut cfg) = config {
@@ -431,6 +435,10 @@ fn process_h264_samples(samples: &[Sample]) -> Result<(Option<H264Config>, Vec<H
                             cfg.pps = nal_data.to_vec();
                         }
                     }
+                    // Also include PPS in stream for decoder compatibility
+                    let len = nal_data.len() as u32;
+                    avcc_data.extend_from_slice(&len.to_be_bytes());
+                    avcc_data.extend_from_slice(nal_data);
                 }
                 NAL_TYPE_IDR => {
                     is_keyframe = true;
