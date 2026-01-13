@@ -9,6 +9,11 @@ fn load_738x720_fixture() -> Vec<u8> {
     include_bytes!("fixtures/test_738x720.ts").to_vec()
 }
 
+/// Load the test fixture with audio (video + audio streams)
+fn load_with_audio_fixture() -> Vec<u8> {
+    include_bytes!("fixtures/test_with_audio.ts").to_vec()
+}
+
 /// NAL unit type constants
 const NAL_TYPE_SPS: u8 = 7;
 const NAL_TYPE_PPS: u8 = 8;
@@ -381,6 +386,26 @@ fn extract_frame_dts(mp4_path: &std::path::Path) -> Vec<i64> {
         .collect()
 }
 
+/// Extract audio frame PTS values from an MP4 file using ffprobe
+fn extract_audio_pts(mp4_path: &std::path::Path) -> Vec<i64> {
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-select_streams", "a:0",
+            "-show_entries", "frame=pts",
+            "-of", "csv=p=0",
+        ])
+        .arg(mp4_path)
+        .output()
+        .expect("ffprobe command failed - is ffmpeg installed?");
+
+    assert!(output.status.success(), "ffprobe failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<i64>().ok())
+        .collect()
+}
+
 #[test]
 fn test_frame_timing_matches_ffmpeg() {
     // This test verifies that ts-to-mp4 produces identical frame timing to ffmpeg.
@@ -440,6 +465,84 @@ fn test_frame_timing_matches_ffmpeg() {
     for (i, (ts2mp4, ffmpeg)) in ts2mp4_dts.iter().zip(ffmpeg_dts.iter()).enumerate() {
         assert_eq!(ts2mp4, ffmpeg,
             "DTS mismatch at frame {}: ts-to-mp4={}, ffmpeg={}",
+            i, ts2mp4, ffmpeg);
+    }
+}
+
+/// Compute deltas (intervals) between consecutive timestamps
+fn compute_deltas(timestamps: &[i64]) -> Vec<i64> {
+    timestamps.windows(2).map(|w| w[1] - w[0]).collect()
+}
+
+#[test]
+fn test_audio_timing_matches_ffmpeg() {
+    // This test verifies that ts-to-mp4 produces identical audio/video timing intervals to ffmpeg.
+    // Uses a synthetic test file with both video and audio streams.
+    // Note: ts-to-mp4 normalizes timestamps to start at 0, while ffmpeg preserves original offsets.
+    // We compare timing *deltas* (intervals) rather than absolute values.
+    // Requires ffmpeg/ffprobe to be installed.
+
+    let ts_data = load_with_audio_fixture();
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+
+    let ts_path = temp_dir.path().join("input_audio.ts");
+    let ts2mp4_path = temp_dir.path().join("ts2mp4_audio.mp4");
+    let ffmpeg_path = temp_dir.path().join("ffmpeg_audio.mp4");
+
+    // Write input TS file
+    std::fs::write(&ts_path, &ts_data).expect("Failed to write TS file");
+
+    // Convert with ts-to-mp4
+    let mut output = Cursor::new(Vec::new());
+    ts_to_mp4::remux(Cursor::new(ts_data), &mut output).expect("ts-to-mp4 remux failed");
+    std::fs::write(&ts2mp4_path, output.into_inner()).expect("Failed to write ts2mp4 output");
+
+    // Convert with ffmpeg (stream copy)
+    let ffmpeg_result = std::process::Command::new("ffmpeg")
+        .args(["-i"])
+        .arg(&ts_path)
+        .args(["-c", "copy", "-y"])
+        .arg(&ffmpeg_path)
+        .output()
+        .expect("ffmpeg command failed - is ffmpeg installed?");
+
+    assert!(ffmpeg_result.status.success(),
+        "ffmpeg conversion failed: {}",
+        String::from_utf8_lossy(&ffmpeg_result.stderr));
+
+    // Extract and compare audio PTS deltas (intervals between frames)
+    let ts2mp4_audio_pts = extract_audio_pts(&ts2mp4_path);
+    let ffmpeg_audio_pts = extract_audio_pts(&ffmpeg_path);
+
+    assert_eq!(ts2mp4_audio_pts.len(), ffmpeg_audio_pts.len(),
+        "Audio frame count mismatch: ts-to-mp4 has {} frames, ffmpeg has {} frames",
+        ts2mp4_audio_pts.len(), ffmpeg_audio_pts.len());
+
+    assert!(!ts2mp4_audio_pts.is_empty(), "Should have at least one audio frame");
+
+    let ts2mp4_audio_deltas = compute_deltas(&ts2mp4_audio_pts);
+    let ffmpeg_audio_deltas = compute_deltas(&ffmpeg_audio_pts);
+
+    for (i, (ts2mp4, ffmpeg)) in ts2mp4_audio_deltas.iter().zip(ffmpeg_audio_deltas.iter()).enumerate() {
+        assert_eq!(ts2mp4, ffmpeg,
+            "Audio PTS delta mismatch at frame {}: ts-to-mp4={}, ffmpeg={}",
+            i, ts2mp4, ffmpeg);
+    }
+
+    // Verify video timing deltas for the audio test file
+    let ts2mp4_video_pts = extract_frame_pts(&ts2mp4_path);
+    let ffmpeg_video_pts = extract_frame_pts(&ffmpeg_path);
+
+    assert_eq!(ts2mp4_video_pts.len(), ffmpeg_video_pts.len(),
+        "Video frame count mismatch in audio test file: ts-to-mp4 has {} frames, ffmpeg has {} frames",
+        ts2mp4_video_pts.len(), ffmpeg_video_pts.len());
+
+    let ts2mp4_video_deltas = compute_deltas(&ts2mp4_video_pts);
+    let ffmpeg_video_deltas = compute_deltas(&ffmpeg_video_pts);
+
+    for (i, (ts2mp4, ffmpeg)) in ts2mp4_video_deltas.iter().zip(ffmpeg_video_deltas.iter()).enumerate() {
+        assert_eq!(ts2mp4, ffmpeg,
+            "Video PTS delta mismatch at frame {}: ts-to-mp4={}, ffmpeg={}",
             i, ts2mp4, ffmpeg);
     }
 }
