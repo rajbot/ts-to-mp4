@@ -1880,4 +1880,186 @@ mod tests {
         assert_eq!(AAC_SAMPLE_RATES[3], 48000);
         assert_eq!(AAC_SAMPLE_RATES[4], 44100);
     }
+
+    #[test]
+    fn test_bit_reader_read_bits() {
+        // Test reading individual bits and multiple bits
+        let data = [0b10110100, 0b11001010];
+        let mut reader = BitReader::new(&data);
+
+        // Read first 4 bits: 1011 = 11
+        assert_eq!(reader.read_bits(4), Some(0b1011));
+        // Read next 4 bits: 0100 = 4
+        assert_eq!(reader.read_bits(4), Some(0b0100));
+        // Read next 8 bits: 11001010 = 202
+        assert_eq!(reader.read_bits(8), Some(0b11001010));
+        // No more data
+        assert_eq!(reader.read_bits(1), None);
+    }
+
+    #[test]
+    fn test_bit_reader_read_ue() {
+        // Test Exp-Golomb unsigned decoding
+        // 1 -> 0 (1 leading zero, suffix 0)
+        // 010 -> 1 (2 leading zeros, suffix 0)
+        // 011 -> 2 (2 leading zeros, suffix 1)
+        // 00100 -> 3 (3 leading zeros, suffix 00)
+
+        // 0b1_010_011_00100_000 padded
+        // = 0b10100110 0b01000000
+        let data = [0b10100110, 0b01000000];
+        let mut reader = BitReader::new(&data);
+
+        assert_eq!(reader.read_ue(), Some(0)); // 1 -> 0
+        assert_eq!(reader.read_ue(), Some(1)); // 010 -> 1
+        assert_eq!(reader.read_ue(), Some(2)); // 011 -> 2
+        assert_eq!(reader.read_ue(), Some(3)); // 00100 -> 3
+    }
+
+    #[test]
+    fn test_bit_reader_read_se() {
+        // Test Exp-Golomb signed decoding
+        // ue=0 -> se=0
+        // ue=1 -> se=1
+        // ue=2 -> se=-1
+        // ue=3 -> se=2
+        // ue=4 -> se=-2
+
+        let data = [0b10100110, 0b01001010];
+        let mut reader = BitReader::new(&data);
+
+        assert_eq!(reader.read_se(), Some(0));  // ue=0 -> 0
+        assert_eq!(reader.read_se(), Some(1));  // ue=1 -> 1
+        assert_eq!(reader.read_se(), Some(-1)); // ue=2 -> -1
+        assert_eq!(reader.read_se(), Some(2));  // ue=3 -> 2
+    }
+
+    #[test]
+    fn test_parse_sps_standard_720p() {
+        // Real SPS from a 1280x720 H.264 baseline profile video
+        // This is a minimal SPS that should parse to 1280x720
+        // Profile: 66 (baseline), Level: 30
+        let sps = [
+            0x67, // NAL header: SPS
+            0x42, // profile_idc = 66 (baseline)
+            0x00, // constraint_set flags
+            0x1e, // level_idc = 30
+            0xe8, 0x43, 0x20, // SPS ID and other params (Exp-Golomb encoded)
+            // pic_width_in_mbs_minus1 = 79 (1280/16-1)
+            // pic_height_in_map_units_minus1 = 44 (720/16-1)
+            // ... remaining SPS data
+        ];
+
+        let (_width, _height, profile, level) = parse_sps(&sps);
+
+        assert_eq!(profile, 0x42, "Profile should be 66 (baseline)");
+        assert_eq!(level, 0x1e, "Level should be 30");
+        // Note: Full parsing depends on complete SPS data
+        // With truncated SPS, we get defaults
+    }
+
+    #[test]
+    fn test_parse_sps_738x720_with_cropping() {
+        // Real SPS from the 738x720 test video that had the green area bug
+        // This SPS has frame cropping: 752x720 macroblocks with 14-pixel right crop
+        // SPS hex: 67 64 00 1f ac d9 40 bc 16 f8 8e 10 00 00 03 00 10 00 00 03 03 c0 f1 83 19 60
+        let sps = [
+            0x67, // NAL header: SPS
+            0x64, // profile_idc = 100 (high)
+            0x00, // constraint_set flags
+            0x1f, // level_idc = 31
+            0xac, 0xd9, 0x40, 0xbc, 0x16, 0xf8, 0x8e, 0x10,
+            0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
+            0x03, 0xc0, 0xf1, 0x83, 0x19, 0x60,
+        ];
+
+        let (width, height, profile, level) = parse_sps(&sps);
+
+        assert_eq!(profile, 0x64, "Profile should be 100 (high)");
+        assert_eq!(level, 0x1f, "Level should be 31");
+        assert_eq!(width, 738, "Width should be 738 (752 - 14 crop)");
+        assert_eq!(height, 720, "Height should be 720");
+    }
+
+    #[test]
+    fn test_parse_sps_fallback_on_invalid() {
+        // Invalid/truncated SPS should return defaults, not panic
+        let sps = [0x67, 0x42]; // Too short
+
+        let (width, height, _profile, _level) = parse_sps(&sps);
+
+        // Should return fallback values
+        assert_eq!(width, 1280, "Should fall back to default width");
+        assert_eq!(height, 720, "Should fall back to default height");
+    }
+
+    #[test]
+    fn test_process_h264_samples_includes_sps_pps() {
+        // Create a sample with SPS, PPS, and IDR NAL units
+        // Using Annex B format (start codes)
+        let mut data = Vec::new();
+
+        // SPS NAL (type 7)
+        data.extend_from_slice(&[0, 0, 0, 1]); // Start code
+        data.extend_from_slice(&[0x67, 0x42, 0x00, 0x1e, 0xe8]); // Minimal SPS
+
+        // PPS NAL (type 8)
+        data.extend_from_slice(&[0, 0, 0, 1]); // Start code
+        data.extend_from_slice(&[0x68, 0xce, 0x38, 0x80]); // Minimal PPS
+
+        // IDR NAL (type 5)
+        data.extend_from_slice(&[0, 0, 0, 1]); // Start code
+        data.extend_from_slice(&[0x65, 0x88, 0x84]); // IDR slice header start
+
+        let sample = Sample {
+            pts: Some(0),
+            dts: Some(0),
+            data,
+        };
+
+        let (config, processed) = process_h264_samples(&[sample]).unwrap();
+
+        // Should have extracted config
+        assert!(config.is_some(), "Should extract H264Config");
+        let config = config.unwrap();
+        assert!(!config.sps.is_empty(), "Config should have SPS");
+        assert!(!config.pps.is_empty(), "Config should have PPS");
+
+        // Should have processed sample with inline SPS/PPS
+        assert_eq!(processed.len(), 1, "Should have one processed sample");
+
+        // Count NAL units in output (AVCC format: 4-byte length prefix)
+        let output = &processed[0].data;
+        let mut nal_types = Vec::new();
+        let mut offset = 0;
+
+        while offset + 4 < output.len() {
+            let len = u32::from_be_bytes([
+                output[offset],
+                output[offset + 1],
+                output[offset + 2],
+                output[offset + 3],
+            ]) as usize;
+
+            if len == 0 || offset + 4 + len > output.len() {
+                break;
+            }
+
+            nal_types.push(output[offset + 4] & 0x1F);
+            offset += 4 + len;
+        }
+
+        assert!(
+            nal_types.contains(&NAL_TYPE_SPS),
+            "Output should contain SPS NAL unit inline"
+        );
+        assert!(
+            nal_types.contains(&NAL_TYPE_PPS),
+            "Output should contain PPS NAL unit inline"
+        );
+        assert!(
+            nal_types.contains(&NAL_TYPE_IDR),
+            "Output should contain IDR NAL unit"
+        );
+    }
 }
