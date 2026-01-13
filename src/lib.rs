@@ -573,6 +573,47 @@ fn process_aac_samples(samples: &[Sample]) -> Result<(Option<AacConfig>, Vec<Aac
 // MP4 Muxer
 // ============================================================================
 
+/// Calculate video duration from actual timestamps
+fn calculate_video_duration(samples: &[H264Sample], default_timescale: u32) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+
+    // Get DTS values (fallback to PTS if DTS not available)
+    let dts_values: Vec<u64> = samples
+        .iter()
+        .map(|s| s.dts.or(s.pts).unwrap_or(0))
+        .collect();
+
+    // Check if we have valid timestamps
+    let has_valid_timestamps = dts_values.iter().any(|&dts| dts > 0);
+
+    if !has_valid_timestamps {
+        // Fall back to hardcoded 30fps
+        return samples.len() as u64 * (default_timescale as u64 / 30);
+    }
+
+    // Find the first non-zero DTS to use as base
+    let first_dts = dts_values.iter().find(|&&d| d > 0).copied().unwrap_or(0);
+    let last_dts = *dts_values.last().unwrap_or(&0);
+
+    // Duration is last - first, plus one frame duration (estimate from average)
+    let total_span = if last_dts > first_dts {
+        last_dts - first_dts
+    } else {
+        0
+    };
+
+    // Add estimated duration of last frame (average frame duration)
+    let avg_frame_duration = if samples.len() > 1 && total_span > 0 {
+        total_span / (samples.len() as u64 - 1)
+    } else {
+        default_timescale as u64 / 30 // Default to 30fps
+    };
+
+    total_span + avg_frame_duration
+}
+
 /// Write MP4 file from processed video and audio
 fn write_mp4<W: Write + Seek>(
     writer: &mut W,
@@ -619,9 +660,9 @@ fn write_mp4<W: Write + Seek>(
         writer.write_all(&sample.data)?;
     }
 
-    // Calculate video timing
-    let video_timescale = 90000u32; // Standard for H.264
-    let video_duration = video_samples.len() as u64 * 3003; // ~30fps
+    // Calculate video timing from actual timestamps
+    let video_timescale = 90000u32; // Standard for MPEG-TS (PTS/DTS are in 90kHz)
+    let video_duration = calculate_video_duration(video_samples, video_timescale);
 
     // Calculate audio timing
     let audio_timescale = audio_config.map(|c| c.sample_rate).unwrap_or(44100);
