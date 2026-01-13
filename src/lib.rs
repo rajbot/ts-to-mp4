@@ -534,7 +534,7 @@ impl<'a> BitReader<'a> {
     /// Read signed Exp-Golomb coded value
     fn read_se(&mut self) -> Option<i32> {
         let ue = self.read_ue()?;
-        let value = ((ue + 1) / 2) as i32;
+        let value = ue.div_ceil(2) as i32;
         if ue % 2 == 0 {
             Some(-value)
         } else {
@@ -670,6 +670,7 @@ struct AacConfig {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct AacSample {
     pts: Option<u64>,
     is_pes_start: bool, // True if this frame starts a new PES packet (has real PTS)
@@ -789,11 +790,7 @@ fn calculate_video_duration(samples: &[H264Sample], default_timescale: u32) -> u
     let last_dts = *dts_values.last().unwrap_or(&0);
 
     // Duration is last - first, plus one frame duration (estimate from average)
-    let total_span = if last_dts > first_dts {
-        last_dts - first_dts
-    } else {
-        0
-    };
+    let total_span = last_dts.saturating_sub(first_dts);
 
     // Add estimated duration of last frame (average frame duration)
     let avg_frame_duration = if samples.len() > 1 && total_span > 0 {
@@ -1078,8 +1075,8 @@ fn write_tkhd<W: Write>(writer: &mut W, track_id: u32, width: u32, height: u32, 
     data.extend_from_slice(&0x40000000u32.to_be_bytes());
 
     // Width and height in 16.16 fixed point
-    data.extend_from_slice(&((width << 16) as u32).to_be_bytes());
-    data.extend_from_slice(&((height << 16) as u32).to_be_bytes());
+    data.extend_from_slice(&(width << 16).to_be_bytes());
+    data.extend_from_slice(&(height << 16).to_be_bytes());
 
     let size = (8 + data.len()) as u32;
     writer.write_all(&size.to_be_bytes())?;
@@ -1281,13 +1278,14 @@ fn write_video_stsd<W: Write>(writer: &mut W, config: &H264Config) -> Result<()>
     avc1_data.extend_from_slice(&(-1i16).to_be_bytes()); // pre_defined
 
     // avcC box
-    let mut avcc_data = Vec::new();
-    avcc_data.push(1); // configuration version
-    avcc_data.push(config.profile);
-    avcc_data.push(0); // profile compatibility
-    avcc_data.push(config.level);
-    avcc_data.push(0xFF); // length size minus one (3 = 4 bytes) | reserved
-    avcc_data.push(0xE1); // num SPS | reserved
+    let mut avcc_data = vec![
+        1,              // configuration version
+        config.profile,
+        0,              // profile compatibility
+        config.level,
+        0xFF,           // length size minus one (3 = 4 bytes) | reserved
+        0xE1,           // num SPS | reserved
+    ];
     avcc_data.extend_from_slice(&(config.sps.len() as u16).to_be_bytes());
     avcc_data.extend_from_slice(&config.sps);
     avcc_data.push(1); // num PPS
@@ -1536,6 +1534,7 @@ fn write_stco<W: Write>(writer: &mut W, offsets: &[u32]) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_audio_trak<W: Write>(
     writer: &mut W,
     config: &AacConfig,
@@ -1726,7 +1725,7 @@ fn write_audio_stsd<W: Write>(writer: &mut W, config: &AacConfig) -> Result<()> 
     mp4a_data.extend_from_slice(&16u16.to_be_bytes()); // sample size (bits)
     mp4a_data.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
     mp4a_data.extend_from_slice(&0u16.to_be_bytes()); // reserved
-    mp4a_data.extend_from_slice(&((config.sample_rate as u32) << 16).to_be_bytes());
+    mp4a_data.extend_from_slice(&(config.sample_rate << 16).to_be_bytes());
 
     // esds box (elementary stream descriptor)
     let esds = build_esds(config);
