@@ -765,6 +765,7 @@ fn write_moov<W: Write>(
             audio_samples,
             audio_timescale,
             audio_duration,
+            video_timescale, // movie timescale for tkhd duration
         )?;
     }
 
@@ -1324,11 +1325,16 @@ fn write_audio_trak<W: Write>(
     samples: &[AacSample],
     timescale: u32,
     duration: u64,
+    movie_timescale: u32,
 ) -> Result<()> {
     let mut trak_data = Vec::new();
 
+    // tkhd duration must be in movie timescale (not audio timescale)
+    // Convert from audio samples to movie timescale
+    let tkhd_duration = (duration * movie_timescale as u64) / timescale as u64;
+
     // tkhd (audio track)
-    write_audio_tkhd(&mut trak_data, 2, duration)?;
+    write_audio_tkhd(&mut trak_data, 2, tkhd_duration)?;
 
     // mdia
     write_audio_mdia(&mut trak_data, config, offsets, sizes, samples, timescale, duration)?;
