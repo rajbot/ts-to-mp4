@@ -470,19 +470,184 @@ fn process_h264_samples(samples: &[Sample]) -> Result<(Option<H264Config>, Vec<H
     Ok((config, processed_samples))
 }
 
-/// Parse SPS to extract video dimensions (simplified)
-fn parse_sps(sps: &[u8]) -> (u32, u32, u8, u8) {
-    if sps.len() < 4 {
-        return (1280, 720, 66, 30); // Default
+/// Bit reader for parsing H.264 NAL units
+struct BitReader<'a> {
+    data: &'a [u8],
+    byte_offset: usize,
+    bit_offset: u8,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            byte_offset: 0,
+            bit_offset: 0,
+        }
     }
 
-    let profile = sps[1];
-    let level = sps[3];
+    fn read_bit(&mut self) -> Option<u8> {
+        if self.byte_offset >= self.data.len() {
+            return None;
+        }
+        let bit = (self.data[self.byte_offset] >> (7 - self.bit_offset)) & 1;
+        self.bit_offset += 1;
+        if self.bit_offset == 8 {
+            self.bit_offset = 0;
+            self.byte_offset += 1;
+        }
+        Some(bit)
+    }
 
-    // Proper SPS parsing requires exp-golomb decoding
-    // For now, return reasonable defaults
-    // A full implementation would parse pic_width_in_mbs_minus1, etc.
-    (1280, 720, profile, level)
+    fn read_bits(&mut self, n: u8) -> Option<u32> {
+        let mut value = 0u32;
+        for _ in 0..n {
+            value = (value << 1) | (self.read_bit()? as u32);
+        }
+        Some(value)
+    }
+
+    /// Read unsigned Exp-Golomb coded value
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut leading_zeros = 0u8;
+        while self.read_bit()? == 0 {
+            leading_zeros += 1;
+            if leading_zeros > 31 {
+                return None; // Prevent infinite loop
+            }
+        }
+        if leading_zeros == 0 {
+            return Some(0);
+        }
+        let suffix = self.read_bits(leading_zeros)?;
+        Some((1 << leading_zeros) - 1 + suffix)
+    }
+
+    /// Read signed Exp-Golomb coded value
+    fn read_se(&mut self) -> Option<i32> {
+        let ue = self.read_ue()?;
+        let value = ((ue + 1) / 2) as i32;
+        if ue % 2 == 0 {
+            Some(-value)
+        } else {
+            Some(value)
+        }
+    }
+}
+
+/// Parse SPS to extract video dimensions
+fn parse_sps(sps: &[u8]) -> (u32, u32, u8, u8) {
+    if sps.len() < 4 {
+        return (1280, 720, 66, 30); // Default fallback
+    }
+
+    let profile_idc = sps[1];
+    let level_idc = sps[3];
+
+    // Skip NAL header byte and start parsing from byte 1
+    let mut reader = BitReader::new(&sps[1..]);
+
+    // profile_idc (8 bits) - already read above, skip
+    reader.read_bits(8);
+    // constraint_set flags (8 bits)
+    reader.read_bits(8);
+    // level_idc (8 bits)
+    reader.read_bits(8);
+    // seq_parameter_set_id
+    reader.read_ue();
+
+    // Handle high profiles
+    if profile_idc == 100 || profile_idc == 110 || profile_idc == 122 ||
+       profile_idc == 244 || profile_idc == 44 || profile_idc == 83 ||
+       profile_idc == 86 || profile_idc == 118 || profile_idc == 128 ||
+       profile_idc == 138 || profile_idc == 139 || profile_idc == 134 {
+        let chroma_format_idc = reader.read_ue().unwrap_or(1);
+        if chroma_format_idc == 3 {
+            reader.read_bits(1); // separate_colour_plane_flag
+        }
+        reader.read_ue(); // bit_depth_luma_minus8
+        reader.read_ue(); // bit_depth_chroma_minus8
+        reader.read_bits(1); // qpprime_y_zero_transform_bypass_flag
+        let seq_scaling_matrix_present = reader.read_bits(1).unwrap_or(0);
+        if seq_scaling_matrix_present == 1 {
+            let count = if chroma_format_idc != 3 { 8 } else { 12 };
+            for i in 0..count {
+                let seq_scaling_list_present = reader.read_bits(1).unwrap_or(0);
+                if seq_scaling_list_present == 1 {
+                    let size = if i < 6 { 16 } else { 64 };
+                    skip_scaling_list(&mut reader, size);
+                }
+            }
+        }
+    }
+
+    // log2_max_frame_num_minus4
+    reader.read_ue();
+    // pic_order_cnt_type
+    let pic_order_cnt_type = reader.read_ue().unwrap_or(0);
+    if pic_order_cnt_type == 0 {
+        reader.read_ue(); // log2_max_pic_order_cnt_lsb_minus4
+    } else if pic_order_cnt_type == 1 {
+        reader.read_bits(1); // delta_pic_order_always_zero_flag
+        reader.read_se(); // offset_for_non_ref_pic
+        reader.read_se(); // offset_for_top_to_bottom_field
+        let num_ref_frames_in_pic_order_cnt_cycle = reader.read_ue().unwrap_or(0);
+        for _ in 0..num_ref_frames_in_pic_order_cnt_cycle {
+            reader.read_se(); // offset_for_ref_frame
+        }
+    }
+
+    // max_num_ref_frames
+    reader.read_ue();
+    // gaps_in_frame_num_value_allowed_flag
+    reader.read_bits(1);
+
+    // pic_width_in_mbs_minus1
+    let pic_width_in_mbs_minus1 = reader.read_ue().unwrap_or(79); // 79 = 1280/16-1
+    // pic_height_in_map_units_minus1
+    let pic_height_in_map_units_minus1 = reader.read_ue().unwrap_or(44); // 44 = 720/16-1
+    // frame_mbs_only_flag
+    let frame_mbs_only_flag = reader.read_bits(1).unwrap_or(1);
+
+    if frame_mbs_only_flag == 0 {
+        reader.read_bits(1); // mb_adaptive_frame_field_flag
+    }
+
+    // direct_8x8_inference_flag
+    reader.read_bits(1);
+
+    // frame_cropping_flag
+    let frame_cropping_flag = reader.read_bits(1).unwrap_or(0);
+    let (crop_left, crop_right, crop_top, crop_bottom) = if frame_cropping_flag == 1 {
+        (
+            reader.read_ue().unwrap_or(0),
+            reader.read_ue().unwrap_or(0),
+            reader.read_ue().unwrap_or(0),
+            reader.read_ue().unwrap_or(0),
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+
+    // Calculate dimensions
+    let width = ((pic_width_in_mbs_minus1 + 1) * 16) - (crop_left + crop_right) * 2;
+    let height = ((2 - frame_mbs_only_flag) * (pic_height_in_map_units_minus1 + 1) * 16)
+        - (crop_top + crop_bottom) * 2;
+
+    (width, height, profile_idc, level_idc)
+}
+
+/// Skip scaling list in SPS (used for high profiles)
+fn skip_scaling_list(reader: &mut BitReader, size: usize) {
+    let mut last_scale = 8i32;
+    let mut next_scale = 8i32;
+    for _ in 0..size {
+        if next_scale != 0 {
+            let delta_scale = reader.read_se().unwrap_or(0);
+            next_scale = (last_scale + delta_scale + 256) % 256;
+        }
+        last_scale = if next_scale == 0 { last_scale } else { next_scale };
+    }
 }
 
 // ============================================================================
