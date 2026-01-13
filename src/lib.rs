@@ -499,6 +499,7 @@ struct AacConfig {
 #[derive(Debug)]
 struct AacSample {
     pts: Option<u64>,
+    is_pes_start: bool, // True if this frame starts a new PES packet (has real PTS)
     data: Vec<u8>,
 }
 
@@ -515,6 +516,8 @@ fn process_aac_samples(samples: &[Sample]) -> Result<(Option<AacConfig>, Vec<Aac
 
     for sample in samples {
         let mut offset = 0;
+        let mut frame_index_in_pes = 0u64;
+        let base_pts = sample.pts;
 
         while offset + 7 <= sample.data.len() {
             // Check ADTS sync word
@@ -544,24 +547,40 @@ fn process_aac_samples(samples: &[Sample]) -> Result<(Option<AacConfig>, Vec<Aac
             }
 
             // Extract configuration from first frame
-            if config.is_none() && (sample_rate_idx as usize) < AAC_SAMPLE_RATES.len() {
+            let sample_rate = if (sample_rate_idx as usize) < AAC_SAMPLE_RATES.len() {
+                AAC_SAMPLE_RATES[sample_rate_idx as usize]
+            } else {
+                44100
+            };
+
+            if config.is_none() {
                 config = Some(AacConfig {
-                    sample_rate: AAC_SAMPLE_RATES[sample_rate_idx as usize],
+                    sample_rate,
                     channels,
                     profile,
                 });
             }
 
+            // Calculate PTS for this frame within the PES packet
+            // Each AAC frame is 1024 samples. PTS is in 90kHz units.
+            // PTS increment per frame = 1024 * 90000 / sample_rate
+            let pts = base_pts.map(|base| {
+                let pts_per_frame = (1024u64 * 90000) / sample_rate as u64;
+                base + frame_index_in_pes * pts_per_frame
+            });
+
             // Extract raw AAC frame (without ADTS header)
             let raw_data = sample.data[offset + header_size..offset + frame_length].to_vec();
             if !raw_data.is_empty() {
                 processed_samples.push(AacSample {
-                    pts: sample.pts,
+                    pts,
+                    is_pes_start: frame_index_in_pes == 0, // First frame in PES has real PTS
                     data: raw_data,
                 });
             }
 
             offset += frame_length;
+            frame_index_in_pes += 1;
         }
     }
 
@@ -1457,47 +1476,81 @@ fn write_audio_stbl<W: Write>(
 }
 
 /// Write audio stts box using actual PTS values from samples
+///
+/// This function calculates per-frame durations that account for timing drift.
+/// AAC frames are nominally 1024 samples, but due to the mismatch between
+/// audio sample rate (e.g., 44100 Hz) and MPEG-TS timestamps (90000 Hz),
+/// some frames need to be 1023 or 1025 samples to maintain sync.
 fn write_audio_stts<W: Write>(writer: &mut W, samples: &[AacSample], sample_rate: u32) -> Result<()> {
     if samples.is_empty() {
         return write_stts(writer, 0, 1024);
     }
 
-    // Collect PTS values (in 90kHz timescale from MPEG-TS)
-    let pts_values: Vec<u64> = samples.iter().map(|s| s.pts.unwrap_or(0)).collect();
+    // Find indices of frames that start a PES (have real PTS values)
+    let pes_starts: Vec<usize> = samples
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_pes_start && s.pts.is_some())
+        .map(|(i, _)| i)
+        .collect();
 
-    // Check if we have valid timestamps
-    let has_valid_timestamps = pts_values.iter().any(|&pts| pts > 0);
-
-    if !has_valid_timestamps {
-        // Fall back to constant 1024 samples per frame
+    // Check if we have enough PES boundaries for timing
+    if pes_starts.len() < 2 {
         return write_stts(writer, samples.len(), 1024);
     }
 
-    // Convert PTS (90kHz) to audio sample counts and calculate deltas
-    // Audio timescale is sample_rate (e.g., 44100 Hz)
-    // PTS is in 90000 Hz
     let mut deltas: Vec<u32> = Vec::new();
 
+    // Track accumulated timing error in fixed-point (16 fractional bits)
+    let mut accumulated_error: i64 = 0;
+
     for i in 0..samples.len() {
-        let delta = if i + 1 < samples.len() {
-            let current_pts = pts_values[i];
-            let next_pts = pts_values[i + 1];
-            if next_pts > current_pts {
-                // Convert from 90kHz to audio sample rate
-                // delta_samples = (delta_pts / 90000) * sample_rate
-                let delta_pts = next_pts - current_pts;
-                ((delta_pts as u64 * sample_rate as u64) / 90000) as u32
-            } else {
-                1024 // Default AAC frame size
+        // Find the current and next PES boundaries for this frame
+        let current_pes_idx = pes_starts.iter().rposition(|&start| start <= i);
+        let next_pes_idx = pes_starts.iter().position(|&start| start > i);
+
+        let delta = match (current_pes_idx, next_pes_idx) {
+            (Some(curr_idx), Some(next_idx)) => {
+                let curr_pes_start = pes_starts[curr_idx];
+                let next_pes_start = pes_starts[next_idx];
+                let curr_pts = samples[curr_pes_start].pts.unwrap();
+                let next_pts = samples[next_pes_start].pts.unwrap();
+
+                if next_pts > curr_pts {
+                    let total_frames = next_pes_start - curr_pes_start;
+                    let delta_pts = next_pts - curr_pts;
+
+                    // Convert to samples in fixed-point (16 fractional bits)
+                    let total_samples_fp = ((delta_pts as i64 * sample_rate as i64) << 16) / 90000;
+
+                    // Calculate average samples per frame with error distribution
+                    let frame_in_segment = i - curr_pes_start;
+
+                    // Expected sample position for this frame
+                    let expected_pos_fp = (total_samples_fp * frame_in_segment as i64) / total_frames as i64;
+                    // Expected sample position for next frame
+                    let next_expected_fp = (total_samples_fp * (frame_in_segment + 1) as i64) / total_frames as i64;
+
+                    // Delta for this frame with accumulated error
+                    let frame_delta_fp = next_expected_fp - expected_pos_fp + accumulated_error;
+
+                    // Round to nearest integer
+                    let frame_delta = ((frame_delta_fp + (1 << 15)) >> 16) as u32;
+
+                    // Clamp to reasonable range
+                    let frame_delta = frame_delta.clamp(1023, 1025);
+
+                    // Update accumulated error
+                    accumulated_error = frame_delta_fp - ((frame_delta as i64) << 16);
+
+                    frame_delta
+                } else {
+                    1024
+                }
             }
-        } else {
-            // Last sample - use 1024 or previous delta
-            if !deltas.is_empty() {
-                deltas[deltas.len() - 1]
-            } else {
-                1024
-            }
+            _ => 1024, // Fallback for edge cases
         };
+
         deltas.push(delta);
     }
 
