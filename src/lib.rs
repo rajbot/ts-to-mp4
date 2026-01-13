@@ -824,6 +824,22 @@ fn write_video_trak<W: Write>(
     // tkhd
     write_tkhd(&mut trak_data, 1, config.width, config.height, duration)?;
 
+    // edts (edit list) - needed for proper A/V sync when first PTS != first DTS
+    // The media_time should be the composition offset of the first frame
+    if let Some(first_sample) = samples.first() {
+        let first_pts = first_sample.pts.unwrap_or(0);
+        let first_dts = first_sample.dts.or(first_sample.pts).unwrap_or(0);
+        let media_time = if first_pts >= first_dts {
+            (first_pts - first_dts) as i32
+        } else {
+            0
+        };
+        // Only write edts if there's a non-zero offset
+        if media_time > 0 {
+            write_edts(&mut trak_data, duration, media_time)?;
+        }
+    }
+
     // mdia
     write_video_mdia(&mut trak_data, config, offsets, sizes, samples, timescale, duration)?;
 
@@ -831,6 +847,33 @@ fn write_video_trak<W: Write>(
     writer.write_all(&size.to_be_bytes())?;
     writer.write_all(b"trak")?;
     writer.write_all(&trak_data)?;
+    Ok(())
+}
+
+/// Write edit list box (edts/elst) for proper playback timing
+fn write_edts<W: Write>(writer: &mut W, duration: u64, media_time: i32) -> Result<()> {
+    let mut edts_data = Vec::new();
+
+    // elst (edit list)
+    let mut elst_data = Vec::new();
+    elst_data.push(0); // version
+    elst_data.extend_from_slice(&[0, 0, 0]); // flags
+    elst_data.extend_from_slice(&1u32.to_be_bytes()); // entry count
+
+    // Single entry: play from media_time for the full duration
+    elst_data.extend_from_slice(&(duration as u32).to_be_bytes()); // segment duration (in movie timescale)
+    elst_data.extend_from_slice(&media_time.to_be_bytes()); // media time (where to start in track)
+    elst_data.extend_from_slice(&0x00010000u32.to_be_bytes()); // media rate (1.0 in 16.16 fixed point)
+
+    let elst_size = (8 + elst_data.len()) as u32;
+    edts_data.extend_from_slice(&elst_size.to_be_bytes());
+    edts_data.extend_from_slice(b"elst");
+    edts_data.extend_from_slice(&elst_data);
+
+    let size = (8 + edts_data.len()) as u32;
+    writer.write_all(&size.to_be_bytes())?;
+    writer.write_all(b"edts")?;
+    writer.write_all(&edts_data)?;
     Ok(())
 }
 
@@ -1191,14 +1234,17 @@ fn write_ctts<W: Write>(writer: &mut W, samples: &[H264Sample]) -> Result<()> {
     }
 
     // Calculate composition time offsets (PTS - DTS)
-    // Only write ctts if there are non-zero offsets (i.e., B-frames present)
-    let offsets: Vec<i32> = samples
+    // In standard video, PTS >= DTS, so offsets should be non-negative
+    let offsets: Vec<u32> = samples
         .iter()
         .map(|s| {
             let pts = s.pts.unwrap_or(0);
             let dts = s.dts.or(s.pts).unwrap_or(0);
-            // CTS offset can be negative in version 1, but we'll use version 1 to be safe
-            (pts as i64 - dts as i64) as i32
+            if pts >= dts {
+                (pts - dts) as u32
+            } else {
+                0 // Clamp negative to 0 for version 0 compatibility
+            }
         })
         .collect();
 
@@ -1208,7 +1254,7 @@ fn write_ctts<W: Write>(writer: &mut W, samples: &[H264Sample]) -> Result<()> {
     }
 
     // Run-length encode the offsets
-    let mut entries: Vec<(u32, i32)> = Vec::new(); // (count, offset)
+    let mut entries: Vec<(u32, u32)> = Vec::new(); // (count, offset)
     for offset in offsets {
         if let Some(last) = entries.last_mut() {
             if last.1 == offset {
@@ -1220,7 +1266,7 @@ fn write_ctts<W: Write>(writer: &mut W, samples: &[H264Sample]) -> Result<()> {
     }
 
     let mut data = Vec::new();
-    data.push(1); // version 1 (allows signed offsets)
+    data.push(0); // version 0 (unsigned offsets, better compatibility)
     data.extend_from_slice(&[0, 0, 0]); // flags
     data.extend_from_slice(&(entries.len() as u32).to_be_bytes());
     for (count, offset) in entries {
@@ -1481,111 +1527,14 @@ fn write_audio_stbl<W: Write>(
     Ok(())
 }
 
-/// Write audio stts box using actual PTS values from samples
+/// Write audio stts box with constant frame duration
 ///
-/// This function calculates per-frame durations that account for timing drift.
-/// AAC frames are nominally 1024 samples, but due to the mismatch between
-/// audio sample rate (e.g., 44100 Hz) and MPEG-TS timestamps (90000 Hz),
-/// some frames need to be 1023 or 1025 samples to maintain sync.
-fn write_audio_stts<W: Write>(writer: &mut W, samples: &[AacSample], sample_rate: u32) -> Result<()> {
-    if samples.is_empty() {
-        return write_stts(writer, 0, 1024);
-    }
-
-    // Find indices of frames that start a PES (have real PTS values)
-    let pes_starts: Vec<usize> = samples
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.is_pes_start && s.pts.is_some())
-        .map(|(i, _)| i)
-        .collect();
-
-    // Check if we have enough PES boundaries for timing
-    if pes_starts.len() < 2 {
-        return write_stts(writer, samples.len(), 1024);
-    }
-
-    let mut deltas: Vec<u32> = Vec::new();
-
-    // Track accumulated timing error in fixed-point (16 fractional bits)
-    let mut accumulated_error: i64 = 0;
-
-    for i in 0..samples.len() {
-        // Find the current and next PES boundaries for this frame
-        let current_pes_idx = pes_starts.iter().rposition(|&start| start <= i);
-        let next_pes_idx = pes_starts.iter().position(|&start| start > i);
-
-        let delta = match (current_pes_idx, next_pes_idx) {
-            (Some(curr_idx), Some(next_idx)) => {
-                let curr_pes_start = pes_starts[curr_idx];
-                let next_pes_start = pes_starts[next_idx];
-                let curr_pts = samples[curr_pes_start].pts.unwrap();
-                let next_pts = samples[next_pes_start].pts.unwrap();
-
-                if next_pts > curr_pts {
-                    let total_frames = next_pes_start - curr_pes_start;
-                    let delta_pts = next_pts - curr_pts;
-
-                    // Convert to samples in fixed-point (16 fractional bits)
-                    let total_samples_fp = ((delta_pts as i64 * sample_rate as i64) << 16) / 90000;
-
-                    // Calculate average samples per frame with error distribution
-                    let frame_in_segment = i - curr_pes_start;
-
-                    // Expected sample position for this frame
-                    let expected_pos_fp = (total_samples_fp * frame_in_segment as i64) / total_frames as i64;
-                    // Expected sample position for next frame
-                    let next_expected_fp = (total_samples_fp * (frame_in_segment + 1) as i64) / total_frames as i64;
-
-                    // Delta for this frame with accumulated error
-                    let frame_delta_fp = next_expected_fp - expected_pos_fp + accumulated_error;
-
-                    // Round to nearest integer
-                    let frame_delta = ((frame_delta_fp + (1 << 15)) >> 16) as u32;
-
-                    // Clamp to reasonable range
-                    let frame_delta = frame_delta.clamp(1023, 1025);
-
-                    // Update accumulated error
-                    accumulated_error = frame_delta_fp - ((frame_delta as i64) << 16);
-
-                    frame_delta
-                } else {
-                    1024
-                }
-            }
-            _ => 1024, // Fallback for edge cases
-        };
-
-        deltas.push(delta);
-    }
-
-    // Run-length encode the deltas
-    let mut entries: Vec<(u32, u32)> = Vec::new();
-    for delta in deltas {
-        if let Some(last) = entries.last_mut() {
-            if last.1 == delta {
-                last.0 += 1;
-                continue;
-            }
-        }
-        entries.push((1, delta));
-    }
-
-    let mut data = Vec::new();
-    data.push(0); // version
-    data.extend_from_slice(&[0, 0, 0]); // flags
-    data.extend_from_slice(&(entries.len() as u32).to_be_bytes());
-    for (count, delta) in entries {
-        data.extend_from_slice(&count.to_be_bytes());
-        data.extend_from_slice(&delta.to_be_bytes());
-    }
-
-    let size = (8 + data.len()) as u32;
-    writer.write_all(&size.to_be_bytes())?;
-    writer.write_all(b"stts")?;
-    writer.write_all(&data)?;
-    Ok(())
+/// AAC frames are always 1024 samples. While there can be slight timing drift
+/// between audio sample rate and MPEG-TS timestamps, using a constant duration
+/// provides the most compatible output for players.
+fn write_audio_stts<W: Write>(writer: &mut W, samples: &[AacSample], _sample_rate: u32) -> Result<()> {
+    // Use constant 1024 samples per AAC frame
+    write_stts(writer, samples.len(), 1024)
 }
 
 fn write_audio_stsd<W: Write>(writer: &mut W, config: &AacConfig) -> Result<()> {
