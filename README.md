@@ -16,6 +16,12 @@ A pure Rust library and CLI tool for remuxing MPEG-TS to MP4 without transcoding
 3. **Processes AAC** - Strips ADTS headers from audio frames
 4. **Muxes to MP4** - Writes a valid MP4 container with proper metadata
 
+## Browser Demo
+
+Try the converter in your browser: **[rajbot.github.io/ts-to-mp4](https://rajbot.github.io/ts-to-mp4)**
+
+All processing happens locally in your browser using WebAssembly - no files are uploaded.
+
 ## Command Line Usage
 
 ### Install
@@ -68,6 +74,20 @@ ts_to_mp4::remux(input, &mut output)?;
 - **Video**: H.264/AVC
 - **Audio**: AAC (ADTS)
 - **Container**: MPEG-TS input, MP4/M4V output
+
+## Building WebAssembly
+
+To build and run the web version locally:
+
+```bash
+# Build WASM module
+./build-wasm.sh
+
+# Start local server
+cd web && python3 -m http.server 8000
+
+# Open http://localhost:8000
+```
 
 ## Limitations
 

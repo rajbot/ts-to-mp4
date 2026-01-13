@@ -7,6 +7,7 @@ description = "Remux MPEG-TS to MP4 without transcoding (stream copy)"
 [lib]
 name = "ts_to_mp4"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "ts-to-mp4"
@@ -15,10 +16,12 @@ path = "src/main.rs"
 [dependencies]
 thiserror = "1"
 clap = { version = "4", features = ["derive"], optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
 
 [features]
 default = []
 cli = ["clap"]
+wasm = ["wasm-bindgen"]
 
 [dev-dependencies]
 tempfile = "3"

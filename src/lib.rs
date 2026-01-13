@@ -1853,6 +1853,27 @@ pub fn remux_file(input_path: &str, output_path: &str) -> Result<()> {
     remux(input, &mut output)
 }
 
+// ============================================================================
+// WebAssembly Support
+// ============================================================================
+
+#[cfg(feature = "wasm")]
+use wasm_bindgen::prelude::*;
+
+/// Convert MPEG-TS data to MP4 (WebAssembly entry point).
+///
+/// Takes raw TS bytes and returns MP4 bytes.
+/// This is the main entry point for browser usage.
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+pub fn convert_ts_to_mp4(input_data: &[u8]) -> std::result::Result<Vec<u8>, JsError> {
+    use std::io::Cursor;
+    let mut output = Cursor::new(Vec::new());
+    remux(Cursor::new(input_data), &mut output)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(output.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

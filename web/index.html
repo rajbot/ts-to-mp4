@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TS to MP4 Converter</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>TS to MP4 Converter</h1>
+        <p class="subtitle">Convert MPEG-TS video files to MP4 format in your browser. No upload required - all processing happens locally.</p>
+
+        <div id="drop-zone" class="drop-zone">
+            <div class="drop-zone-content">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="17 8 12 3 7 8"/>
+                    <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                <p>Drag & drop a .ts file here</p>
+                <p class="or">or</p>
+                <label class="file-button">
+                    Browse Files
+                    <input type="file" id="file-input" accept=".ts,.TS" hidden>
+                </label>
+            </div>
+        </div>
+
+        <div id="progress-section" class="progress-section hidden">
+            <div class="file-info">
+                <span id="file-name"></span>
+                <span id="file-size"></span>
+            </div>
+            <div class="progress-bar">
+                <div id="progress-fill" class="progress-fill"></div>
+            </div>
+            <p id="status-text" class="status-text">Loading...</p>
+        </div>
+
+        <div id="result-section" class="result-section hidden">
+            <div class="success-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                    <polyline points="22 4 12 14.01 9 11.01"/>
+                </svg>
+            </div>
+            <p class="result-text">Conversion complete!</p>
+            <button id="download-button" class="download-button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                Download MP4
+            </button>
+            <button id="convert-another" class="secondary-button">Convert Another File</button>
+        </div>
+
+        <div id="error-section" class="error-section hidden">
+            <p class="error-text" id="error-message"></p>
+            <button id="try-again" class="secondary-button">Try Again</button>
+        </div>
+
+        <footer>
+            <p>Powered by <a href="https://github.com/rajbot/ts-to-mp4" target="_blank">ts-to-mp4</a> - Pure Rust, compiled to WebAssembly</p>
+        </footer>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

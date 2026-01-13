@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Build CLI
+        run: cargo build --features cli --verbose
+
+      - name: Check WASM build
+        run: |
+          cargo install wasm-pack
+          wasm-pack build --target web --features wasm
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          components: clippy
+
+      - name: Run Clippy
+        run: cargo clippy -- -D warnings
