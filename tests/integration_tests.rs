@@ -336,3 +336,110 @@ fn test_find_avcc_nal_units_truncated() {
     let units = find_avcc_nal_units(&data);
     assert!(units.is_empty());
 }
+
+// ============================================================================
+// FFmpeg Comparison Tests
+// ============================================================================
+
+/// Extract frame timing (PTS values) from an MP4 file using ffprobe
+fn extract_frame_pts(mp4_path: &std::path::Path) -> Vec<i64> {
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-select_streams", "v:0",
+            "-show_entries", "frame=pts",
+            "-of", "csv=p=0",
+        ])
+        .arg(mp4_path)
+        .output()
+        .expect("ffprobe command failed - is ffmpeg installed?");
+
+    assert!(output.status.success(), "ffprobe failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<i64>().ok())
+        .collect()
+}
+
+/// Extract frame DTS values from an MP4 file using ffprobe
+fn extract_frame_dts(mp4_path: &std::path::Path) -> Vec<i64> {
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-select_streams", "v:0",
+            "-show_entries", "frame=pkt_dts",
+            "-of", "csv=p=0",
+        ])
+        .arg(mp4_path)
+        .output()
+        .expect("ffprobe command failed - is ffmpeg installed?");
+
+    assert!(output.status.success(), "ffprobe failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<i64>().ok())
+        .collect()
+}
+
+#[test]
+fn test_frame_timing_matches_ffmpeg() {
+    // This test verifies that ts-to-mp4 produces identical frame timing to ffmpeg.
+    // Requires ffmpeg/ffprobe to be installed.
+
+    let ts_data = load_738x720_fixture();
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+
+    let ts_path = temp_dir.path().join("input.ts");
+    let ts2mp4_path = temp_dir.path().join("ts2mp4.mp4");
+    let ffmpeg_path = temp_dir.path().join("ffmpeg.mp4");
+
+    // Write input TS file
+    std::fs::write(&ts_path, &ts_data).expect("Failed to write TS file");
+
+    // Convert with ts-to-mp4
+    let mut output = Cursor::new(Vec::new());
+    ts_to_mp4::remux(Cursor::new(ts_data), &mut output).expect("ts-to-mp4 remux failed");
+    std::fs::write(&ts2mp4_path, output.into_inner()).expect("Failed to write ts2mp4 output");
+
+    // Convert with ffmpeg (stream copy)
+    let ffmpeg_result = std::process::Command::new("ffmpeg")
+        .args(["-i"])
+        .arg(&ts_path)
+        .args(["-c", "copy", "-y"])
+        .arg(&ffmpeg_path)
+        .output()
+        .expect("ffmpeg command failed - is ffmpeg installed?");
+
+    assert!(ffmpeg_result.status.success(),
+        "ffmpeg conversion failed: {}",
+        String::from_utf8_lossy(&ffmpeg_result.stderr));
+
+    // Extract and compare PTS values
+    let ts2mp4_pts = extract_frame_pts(&ts2mp4_path);
+    let ffmpeg_pts = extract_frame_pts(&ffmpeg_path);
+
+    assert_eq!(ts2mp4_pts.len(), ffmpeg_pts.len(),
+        "Frame count mismatch: ts-to-mp4 has {} frames, ffmpeg has {} frames",
+        ts2mp4_pts.len(), ffmpeg_pts.len());
+
+    assert!(!ts2mp4_pts.is_empty(), "Should have at least one frame");
+
+    for (i, (ts2mp4, ffmpeg)) in ts2mp4_pts.iter().zip(ffmpeg_pts.iter()).enumerate() {
+        assert_eq!(ts2mp4, ffmpeg,
+            "PTS mismatch at frame {}: ts-to-mp4={}, ffmpeg={}",
+            i, ts2mp4, ffmpeg);
+    }
+
+    // Extract and compare DTS values
+    let ts2mp4_dts = extract_frame_dts(&ts2mp4_path);
+    let ffmpeg_dts = extract_frame_dts(&ffmpeg_path);
+
+    assert_eq!(ts2mp4_dts.len(), ffmpeg_dts.len(),
+        "DTS frame count mismatch");
+
+    for (i, (ts2mp4, ffmpeg)) in ts2mp4_dts.iter().zip(ffmpeg_dts.iter()).enumerate() {
+        assert_eq!(ts2mp4, ffmpeg,
+            "DTS mismatch at frame {}: ts-to-mp4={}, ffmpeg={}",
+            i, ts2mp4, ffmpeg);
+    }
+}
