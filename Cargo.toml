@@ -1,0 +1,11 @@
+[package]
+name = "ts-to-mp4"
+version = "0.1.0"
+edition = "2021"
+description = "Remux MPEG-TS to MP4 without transcoding (stream copy)"
+
+[dependencies]
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
