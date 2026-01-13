@@ -345,7 +345,6 @@ struct H264Config {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 struct H264Sample {
     pts: Option<u64>,
     dts: Option<u64>,
@@ -955,8 +954,11 @@ fn write_video_stbl<W: Write>(
     // stsd
     write_video_stsd(&mut stbl_data, config)?;
 
-    // stts
-    write_stts(&mut stbl_data, samples.len(), timescale / 30)?; // Assume 30fps
+    // stts - use actual DTS values if available, otherwise assume constant frame rate
+    write_video_stts(&mut stbl_data, samples, timescale)?;
+
+    // ctts - composition time offsets (PTS - DTS), needed for B-frames
+    write_ctts(&mut stbl_data, samples)?;
 
     // stss (sync samples / keyframes)
     write_stss(&mut stbl_data, samples)?;
@@ -1042,6 +1044,130 @@ fn write_stts<W: Write>(writer: &mut W, sample_count: usize, sample_delta: u32) 
     let size = (8 + data.len()) as u32;
     writer.write_all(&size.to_be_bytes())?;
     writer.write_all(b"stts")?;
+    writer.write_all(&data)?;
+    Ok(())
+}
+
+/// Write stts box using actual DTS values from samples
+fn write_video_stts<W: Write>(writer: &mut W, samples: &[H264Sample], timescale: u32) -> Result<()> {
+    if samples.is_empty() {
+        return write_stts(writer, 0, 0);
+    }
+
+    // Collect DTS values, using PTS as fallback if DTS is not available
+    let dts_values: Vec<u64> = samples
+        .iter()
+        .map(|s| s.dts.or(s.pts).unwrap_or(0))
+        .collect();
+
+    // Check if we have valid timestamps (not all zeros)
+    let has_valid_timestamps = dts_values.iter().any(|&dts| dts > 0);
+
+    if !has_valid_timestamps {
+        // Fall back to constant frame rate (assume 30fps)
+        return write_stts(writer, samples.len(), timescale / 30);
+    }
+
+    // Calculate deltas between consecutive DTS values
+    let mut deltas: Vec<u32> = Vec::new();
+    for i in 0..samples.len() {
+        let delta = if i + 1 < samples.len() {
+            // Delta to next sample
+            let current_dts = dts_values[i];
+            let next_dts = dts_values[i + 1];
+            if next_dts > current_dts {
+                (next_dts - current_dts) as u32
+            } else {
+                // Handle wraparound or out-of-order - use default
+                timescale / 30
+            }
+        } else {
+            // Last sample - use previous delta or default
+            if !deltas.is_empty() {
+                deltas[deltas.len() - 1]
+            } else {
+                timescale / 30
+            }
+        };
+        deltas.push(delta);
+    }
+
+    // Run-length encode the deltas
+    let mut entries: Vec<(u32, u32)> = Vec::new(); // (count, delta)
+    for delta in deltas {
+        if let Some(last) = entries.last_mut() {
+            if last.1 == delta {
+                last.0 += 1;
+                continue;
+            }
+        }
+        entries.push((1, delta));
+    }
+
+    let mut data = Vec::new();
+    data.push(0); // version
+    data.extend_from_slice(&[0, 0, 0]); // flags
+    data.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (count, delta) in entries {
+        data.extend_from_slice(&count.to_be_bytes());
+        data.extend_from_slice(&delta.to_be_bytes());
+    }
+
+    let size = (8 + data.len()) as u32;
+    writer.write_all(&size.to_be_bytes())?;
+    writer.write_all(b"stts")?;
+    writer.write_all(&data)?;
+    Ok(())
+}
+
+/// Write ctts box (composition time to sample) for B-frame reordering
+/// This specifies the offset between decode time (DTS) and presentation time (PTS)
+fn write_ctts<W: Write>(writer: &mut W, samples: &[H264Sample]) -> Result<()> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+
+    // Calculate composition time offsets (PTS - DTS)
+    // Only write ctts if there are non-zero offsets (i.e., B-frames present)
+    let offsets: Vec<i32> = samples
+        .iter()
+        .map(|s| {
+            let pts = s.pts.unwrap_or(0);
+            let dts = s.dts.or(s.pts).unwrap_or(0);
+            // CTS offset can be negative in version 1, but we'll use version 1 to be safe
+            (pts as i64 - dts as i64) as i32
+        })
+        .collect();
+
+    // Check if all offsets are zero - if so, skip ctts box
+    if offsets.iter().all(|&o| o == 0) {
+        return Ok(());
+    }
+
+    // Run-length encode the offsets
+    let mut entries: Vec<(u32, i32)> = Vec::new(); // (count, offset)
+    for offset in offsets {
+        if let Some(last) = entries.last_mut() {
+            if last.1 == offset {
+                last.0 += 1;
+                continue;
+            }
+        }
+        entries.push((1, offset));
+    }
+
+    let mut data = Vec::new();
+    data.push(1); // version 1 (allows signed offsets)
+    data.extend_from_slice(&[0, 0, 0]); // flags
+    data.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (count, offset) in entries {
+        data.extend_from_slice(&count.to_be_bytes());
+        data.extend_from_slice(&offset.to_be_bytes());
+    }
+
+    let size = (8 + data.len()) as u32;
+    writer.write_all(&size.to_be_bytes())?;
+    writer.write_all(b"ctts")?;
     writer.write_all(&data)?;
     Ok(())
 }
