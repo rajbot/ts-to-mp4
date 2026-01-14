@@ -1,5 +1,7 @@
 # ts-to-mp4
 
+![Tests](https://github.com/rajbot/ts-to-mp4/actions/workflows/ci.yml/badge.svg)
+
 A pure Rust library and CLI tool for remuxing MPEG-TS to MP4 without transcoding, similar to `ffmpeg -c copy`.
 
 ## Features

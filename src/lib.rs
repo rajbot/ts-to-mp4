@@ -802,6 +802,45 @@ fn calculate_video_duration(samples: &[H264Sample], default_timescale: u32) -> u
     total_span + avg_frame_duration
 }
 
+/// Calculate start delays for edit lists to preserve original A/V sync timing.
+/// Returns (video_start_delay, audio_start_delay) in 90kHz timescale (MPEG-TS standard).
+/// ffmpeg normalizes audio to start at 0, then delays video if it starts later.
+fn calculate_start_delays(
+    video_samples: &[H264Sample],
+    audio_samples: &[AacSample],
+) -> (u64, u64) {
+    // Get first timestamps from each track
+    let video_first_dts = video_samples
+        .first()
+        .and_then(|s| s.dts.or(s.pts))
+        .unwrap_or(0);
+
+    let audio_first_pts = audio_samples
+        .first()
+        .and_then(|s| s.pts)
+        .unwrap_or(0);
+
+    // If no audio, no delay needed
+    if audio_samples.is_empty() {
+        return (0, 0);
+    }
+
+    // PTS/DTS in MPEG-TS are always in 90kHz regardless of audio sample rate
+    // Calculate relative offset: positive if video starts after audio
+    if video_first_dts >= audio_first_pts {
+        // Video starts at or after audio - add delay to video track
+        let delay = video_first_dts - audio_first_pts;
+        (delay, 0)
+    } else {
+        // Audio starts after video - add delay to audio track
+        // Convert to movie timescale (which is video_timescale for the video track)
+        let delay = audio_first_pts - video_first_dts;
+        // Audio delay needs to be in movie timescale for tkhd, but the empty edit
+        // duration in elst should be in movie timescale (video_timescale)
+        (0, delay)
+    }
+}
+
 /// Write MP4 file from processed video and audio
 fn write_mp4<W: Write + Seek>(
     writer: &mut W,
@@ -857,6 +896,14 @@ fn write_mp4<W: Write + Seek>(
     let audio_frame_duration = 1024u32; // AAC frame size
     let audio_duration = audio_samples.len() as u64 * audio_frame_duration as u64;
 
+    // Calculate start delays for edit lists to preserve original A/V sync
+    // ffmpeg normalizes audio to start at 0, then adds an empty edit to video
+    // if video starts later than audio
+    let (video_start_delay, audio_start_delay) = calculate_start_delays(
+        video_samples,
+        audio_samples,
+    );
+
     // Write moov box
     write_moov(
         writer,
@@ -866,12 +913,14 @@ fn write_mp4<W: Write + Seek>(
         video_samples,
         video_timescale,
         video_duration,
+        video_start_delay,
         audio_config,
         &audio_offsets,
         &audio_sizes,
         audio_samples,
         audio_timescale,
         audio_duration,
+        audio_start_delay,
     )?;
 
     Ok(())
@@ -902,12 +951,14 @@ fn write_moov<W: Write>(
     video_samples: &[H264Sample],
     video_timescale: u32,
     video_duration: u64,
+    video_start_delay: u64,
     audio_config: Option<&AacConfig>,
     audio_offsets: &[u32],
     audio_sizes: &[u32],
     audio_samples: &[AacSample],
     audio_timescale: u32,
     audio_duration: u64,
+    audio_start_delay: u64,
 ) -> Result<()> {
     let mut moov_data = Vec::new();
 
@@ -923,6 +974,7 @@ fn write_moov<W: Write>(
         video_samples,
         video_timescale,
         video_duration,
+        video_start_delay,
     )?;
 
     // Audio track (if present)
@@ -936,6 +988,7 @@ fn write_moov<W: Write>(
             audio_timescale,
             audio_duration,
             video_timescale, // movie timescale for tkhd duration
+            audio_start_delay,
         )?;
     }
 
@@ -980,6 +1033,7 @@ fn write_mvhd<W: Write>(writer: &mut W, timescale: u32, duration: u64) -> Result
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_video_trak<W: Write>(
     writer: &mut W,
     config: &H264Config,
@@ -988,26 +1042,32 @@ fn write_video_trak<W: Write>(
     samples: &[H264Sample],
     timescale: u32,
     duration: u64,
+    start_delay: u64,
 ) -> Result<()> {
     let mut trak_data = Vec::new();
 
-    // tkhd
-    write_tkhd(&mut trak_data, 1, config.width, config.height, duration)?;
+    // tkhd - duration should include any start delay
+    let tkhd_duration = duration + start_delay;
+    write_tkhd(&mut trak_data, 1, config.width, config.height, tkhd_duration)?;
 
-    // edts (edit list) - needed for proper A/V sync when first PTS != first DTS
-    // The media_time should be the composition offset of the first frame
-    if let Some(first_sample) = samples.first() {
+    // edts (edit list) - needed for:
+    // 1. Start delay (empty edit with media_time=-1 to create gap at start)
+    // 2. PTS-DTS offset (media_time points to first presentation time)
+    let media_time = if let Some(first_sample) = samples.first() {
         let first_pts = first_sample.pts.unwrap_or(0);
         let first_dts = first_sample.dts.or(first_sample.pts).unwrap_or(0);
-        let media_time = if first_pts >= first_dts {
-            (first_pts - first_dts) as i32
+        if first_pts >= first_dts {
+            (first_pts - first_dts) as i64
         } else {
             0
-        };
-        // Only write edts if there's a non-zero offset
-        if media_time > 0 {
-            write_edts(&mut trak_data, duration, media_time)?;
         }
+    } else {
+        0
+    };
+
+    // Write edit list if there's a start delay or media_time offset
+    if start_delay > 0 || media_time > 0 {
+        write_edts_with_delay(&mut trak_data, duration, start_delay, media_time)?;
     }
 
     // mdia
@@ -1020,20 +1080,39 @@ fn write_video_trak<W: Write>(
     Ok(())
 }
 
-/// Write edit list box (edts/elst) for proper playback timing
-fn write_edts<W: Write>(writer: &mut W, duration: u64, media_time: i32) -> Result<()> {
+/// Write edit list with optional start delay (empty edit) to preserve A/V sync.
+///
+/// This creates an edit list like ffmpeg does:
+/// - If start_delay > 0: First entry is an empty edit (media_time=-1) that creates a gap
+/// - Second entry (or first if no delay): Content edit with media_time offset for B-frames
+fn write_edts_with_delay<W: Write>(
+    writer: &mut W,
+    duration: u64,
+    start_delay: u64,
+    media_time: i64,
+) -> Result<()> {
     let mut edts_data = Vec::new();
 
     // elst (edit list)
     let mut elst_data = Vec::new();
-    elst_data.push(0); // version
+    elst_data.push(0); // version 0
     elst_data.extend_from_slice(&[0, 0, 0]); // flags
-    elst_data.extend_from_slice(&1u32.to_be_bytes()); // entry count
 
-    // Single entry: play from media_time for the full duration
-    elst_data.extend_from_slice(&(duration as u32).to_be_bytes()); // segment duration (in movie timescale)
-    elst_data.extend_from_slice(&media_time.to_be_bytes()); // media time (where to start in track)
-    elst_data.extend_from_slice(&0x00010000u32.to_be_bytes()); // media rate (1.0 in 16.16 fixed point)
+    let entry_count = if start_delay > 0 { 2u32 } else { 1u32 };
+    elst_data.extend_from_slice(&entry_count.to_be_bytes());
+
+    // Entry 1: Empty edit (if start_delay > 0)
+    // This creates a gap at the start of the track
+    if start_delay > 0 {
+        elst_data.extend_from_slice(&(start_delay as u32).to_be_bytes()); // segment duration
+        elst_data.extend_from_slice(&(-1i32).to_be_bytes()); // media_time = -1 means empty edit
+        elst_data.extend_from_slice(&0x00010000u32.to_be_bytes()); // media rate (1.0)
+    }
+
+    // Entry 2 (or 1): Content edit - play the actual media
+    elst_data.extend_from_slice(&(duration as u32).to_be_bytes()); // segment duration
+    elst_data.extend_from_slice(&(media_time as i32).to_be_bytes()); // media time (PTS-DTS offset)
+    elst_data.extend_from_slice(&0x00010000u32.to_be_bytes()); // media rate (1.0)
 
     let elst_size = (8 + elst_data.len()) as u32;
     edts_data.extend_from_slice(&elst_size.to_be_bytes());
@@ -1544,6 +1623,7 @@ fn write_audio_trak<W: Write>(
     timescale: u32,
     duration: u64,
     movie_timescale: u32,
+    start_delay: u64,
 ) -> Result<()> {
     let mut trak_data = Vec::new();
 
@@ -1551,8 +1631,17 @@ fn write_audio_trak<W: Write>(
     // Convert from audio samples to movie timescale
     let tkhd_duration = (duration * movie_timescale as u64) / timescale as u64;
 
+    // Add start delay (already in movie timescale from calculate_start_delays)
+    let tkhd_duration_with_delay = tkhd_duration + start_delay;
+
     // tkhd (audio track)
-    write_audio_tkhd(&mut trak_data, 2, tkhd_duration)?;
+    write_audio_tkhd(&mut trak_data, 2, tkhd_duration_with_delay)?;
+
+    // edts (edit list) - if there's a start delay, create empty edit for gap
+    if start_delay > 0 {
+        // For audio, media_time is 0 (no PTS-DTS offset like video)
+        write_edts_with_delay(&mut trak_data, tkhd_duration, start_delay, 0)?;
+    }
 
     // mdia
     write_audio_mdia(&mut trak_data, config, offsets, sizes, samples, timescale, duration)?;
