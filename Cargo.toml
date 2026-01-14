@@ -3,6 +3,10 @@ name = "ts-to-mp4"
 version = "0.1.0"
 edition = "2021"
 description = "Remux MPEG-TS to MP4 without transcoding (stream copy)"
+license = "AGPL-3.0"
+repository = "https://github.com/rajbot/ts-to-mp4"
+keywords = ["video", "mp4", "mpeg-ts", "remux", "h264"]
+categories = ["multimedia::video", "command-line-utilities"]
 
 [lib]
 name = "ts_to_mp4"
